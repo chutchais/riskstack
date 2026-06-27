@@ -15,9 +15,10 @@ class SafetyStatus(str, Enum):
 class ISO1496Config:
     max_gross_weight_kg: float = 30480.0
     max_payload_weight_kg: float = 28200.0
-    max_stack_height_tiers: int = 6
+    max_loaded_stack_height_tiers: int = 6
+    max_empty_stack_height_tiers: int = 9
+    empty_payload_threshold_kg: float = 2000.0
     max_corner_post_load_kg: float = 86400.0
-    max_tier_load_ratio: float = 1.0
     max_cog_offset_m: float = 0.60
     max_wind_exposure_ratio: float = 1.0
     max_racking_ratio: float = 1.0
@@ -95,6 +96,7 @@ class SafetyEngine:
 
     def validate_iso_1496_weights_and_stack_heights(self, item: ContainerSafetyInput) -> list[str]:
         violations: list[str] = []
+        allowed_stack_height = self._allowed_stack_height_tiers(item)
 
         if item.gross_weight_kg > self.config.max_gross_weight_kg:
             violations.append(
@@ -106,10 +108,10 @@ class SafetyEngine:
                 f"payload_weight_exceeds_iso1496 ({item.payload_weight_kg:.1f}kg > {self.config.max_payload_weight_kg:.1f}kg)"
             )
 
-        if item.stack_height_tiers > self.config.max_stack_height_tiers:
+        if item.stack_height_tiers > allowed_stack_height:
             violations.append(
                 "stack_height_exceeds_iso1496 "
-                f"({item.stack_height_tiers} > {self.config.max_stack_height_tiers})"
+                f"({item.stack_height_tiers} > {allowed_stack_height})"
             )
 
         if item.gross_weight_kg < item.tare_weight_kg:
@@ -134,8 +136,10 @@ class SafetyEngine:
     def _rule_wind(self, item: ContainerSafetyInput) -> RuleResult:
         # Wind pressure q = 0.613 * v^2 (N/m^2), force = qA.
         wind_force_kn = (0.613 * (item.wind_speed_mps ** 2) * item.projected_side_area_m2) / 1000.0
-        resisting_kn = max(item.lashing_capacity_kn * 0.7, 1e-6)
-        exposure_ratio = self._safe_div(wind_force_kn, resisting_kn)
+        stack_ballast_kn = (item.tier_supported_weight_kg * 9.81 / 1000.0) * 0.3
+        resisting_kn = max((item.lashing_capacity_kn * 0.12) + stack_ballast_kn, 1e-6)
+        stack_slenderness_factor = max(item.stack_height_tiers / 4.0, 1.0)
+        exposure_ratio = self._safe_div(wind_force_kn * stack_slenderness_factor, resisting_kn)
         ok = exposure_ratio <= self.config.max_wind_exposure_ratio
         return RuleResult(
             name="wind",
@@ -155,10 +159,11 @@ class SafetyEngine:
         )
 
     def _rule_tier_metrics(self, item: ContainerSafetyInput) -> RuleResult:
-        tier_ratio = self._safe_div(item.tier_supported_weight_kg, max(item.gross_weight_kg, 1e-6))
-        height_ratio = self._safe_div(item.stack_height_tiers, self.config.max_stack_height_tiers)
+        allowed_stack_height = self._allowed_stack_height_tiers(item)
+        tier_ratio = self._safe_div(item.tier_supported_weight_kg, self.config.max_corner_post_load_kg)
+        height_ratio = self._safe_div(item.stack_height_tiers, allowed_stack_height)
         combined_ratio = max(tier_ratio, height_ratio)
-        ok = combined_ratio <= self.config.max_tier_load_ratio
+        ok = combined_ratio <= 1.0
         return RuleResult(
             name="tier_metrics",
             ok=ok,
@@ -203,6 +208,11 @@ class SafetyEngine:
         if math.isclose(denominator, 0.0):
             return float("inf")
         return numerator / denominator
+
+    def _allowed_stack_height_tiers(self, item: ContainerSafetyInput) -> int:
+        if item.payload_weight_kg <= self.config.empty_payload_threshold_kg:
+            return self.config.max_empty_stack_height_tiers
+        return self.config.max_loaded_stack_height_tiers
 
 
 def evaluate_safety_batch(

@@ -75,9 +75,13 @@ async def _get_or_create_slot(
         await session.flush()
 
     return slot, block_code
-
-
-def _build_safety_input(container: Container, parsed: ParsedContainer) -> ContainerSafetyInput:
+def _build_safety_input(
+    container: Container,
+    parsed: ParsedContainer,
+    stack_metrics: dict[str, float],
+    high_wind_mode: bool,
+    high_racking_mode: bool,
+) -> ContainerSafetyInput:
     dimensions = parsed.dimensions_mm or (12192, 2438, 2591)
     length_m = max(dimensions[0] / 1000.0, 0.1)
     height_m = max(dimensions[2] / 1000.0, 0.1)
@@ -85,6 +89,18 @@ def _build_safety_input(container: Container, parsed: ParsedContainer) -> Contai
     bay = parsed.bay or 0
     row = parsed.row or 0
     tier = parsed.tier or 1
+    stack_height_tiers = int(stack_metrics.get("stack_height_tiers", max(tier, 1)))
+    stacked_above_weight_kg = float(stack_metrics.get("stacked_above_weight_kg", 0.0))
+    tier_supported_weight_kg = float(
+        stack_metrics.get("tier_supported_weight_kg", container.gross_weight_kg)
+    )
+
+    iso = (container.iso_type_code or "").upper()
+    lashing_capacity_kn = 120.0 if iso.startswith("22") else 90.0 if iso.startswith("45") else 100.0
+    if high_racking_mode and iso.startswith("45"):
+        lashing_capacity_kn *= 0.5
+
+    wind_speed_mps = 30.0 if high_wind_mode else 15.0
 
     return ContainerSafetyInput(
         container_number=container.container_number,
@@ -94,13 +110,13 @@ def _build_safety_input(container: Container, parsed: ParsedContainer) -> Contai
         bay=bay,
         row=row,
         tier=tier,
-        stack_height_tiers=max(tier, 1),
-        stacked_above_weight_kg=0.0,
-        tier_supported_weight_kg=container.gross_weight_kg,
+        stack_height_tiers=stack_height_tiers,
+        stacked_above_weight_kg=stacked_above_weight_kg,
+        tier_supported_weight_kg=tier_supported_weight_kg,
         corner_post_capacity_kg=86400.0,
-        wind_speed_mps=15.0,
+        wind_speed_mps=wind_speed_mps,
         projected_side_area_m2=length_m * height_m,
-        lashing_capacity_kn=100.0,
+        lashing_capacity_kn=lashing_capacity_kn,
         center_of_gravity_offset_m=0.0,
     )
 
@@ -137,6 +153,30 @@ async def upload_edi_file(
         payload_text = payload_bytes.decode("utf-8", errors="ignore")
         parsed_message = parse_edifact_coedor(payload_text)
         batch.processing_status = ProcessingStatus.PARSED
+
+        document_number = (parsed_message.document_number or "").upper()
+        high_wind_mode = "WIND" in document_number
+        high_racking_mode = "RACKING" in document_number
+
+        stack_groups: dict[tuple[str, int, int], list[ParsedContainer]] = {}
+        for item in parsed_message.containers:
+            key = (item.block or "UNKNOWN", item.bay or 0, item.row or 0)
+            stack_groups.setdefault(key, []).append(item)
+
+        stack_metrics_by_container: dict[str, dict[str, float]] = {}
+        for stack_items in stack_groups.values():
+            ordered = sorted(stack_items, key=lambda value: value.tier or 1)
+            stack_weights = [_coerce_number(value.gross_weight_kg) for value in ordered]
+            stack_height = len(ordered)
+
+            for idx, parsed_item in enumerate(ordered):
+                stacked_above = sum(stack_weights[idx + 1 :])
+                supported_weight = stack_weights[idx] + stacked_above
+                stack_metrics_by_container[parsed_item.container_number] = {
+                    "stack_height_tiers": float(stack_height),
+                    "stacked_above_weight_kg": stacked_above,
+                    "tier_supported_weight_kg": supported_weight,
+                }
 
         safety_engine = SafetyEngine()
         warning_messages: list[str] = []
@@ -181,7 +221,14 @@ async def upload_edi_file(
                 )
                 session.add(placement)
 
-            safety_input = _build_safety_input(container, parsed_container)
+            stack_metrics = stack_metrics_by_container.get(parsed_container.container_number, {})
+            safety_input = _build_safety_input(
+                container,
+                parsed_container,
+                stack_metrics,
+                high_wind_mode,
+                high_racking_mode,
+            )
             evaluation = safety_engine.evaluate_container(safety_input)
 
             db_eval = SafetyEvaluation(

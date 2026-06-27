@@ -151,19 +151,39 @@ class EdiCoedorParser:
 
     def _parse_loc(self, container: ParsedContainer, elements: list[str]) -> None:
         qualifier = (self._safe_get(elements, 0) or "").upper()
-        location = self._extract_composite_value(self._safe_get(elements, 1))
-        if not location:
+        raw_location = self._safe_get(elements, 1)
+        if not raw_location:
             return
+
+        location = self._extract_location_label(raw_location) or ""
+        normalized = location.upper()
+
+        block_match = re.search(r"BLOCK[-\s]?([A-Z0-9]+)", normalized)
+        bay_match = re.search(r"BAY[-\s]?(\d+)", normalized)
+        row_match = re.search(r"ROW[-\s]?(\d+)", normalized)
+        tier_match = re.search(r"TIER[-\s]?(\d+)", normalized)
+
+        if block_match:
+            container.block = f"BLOCK-{block_match.group(1)}"
+
+        if bay_match:
+            container.bay = int(bay_match.group(1))
+
+        if row_match:
+            container.row = int(row_match.group(1))
+
+        if tier_match:
+            container.tier = int(tier_match.group(1))
 
         # Common yard slot patterns: BAY/ROW/TIER encoded as 3-2-2 digits.
         digits = "".join(ch for ch in location if ch.isdigit())
-        if len(digits) >= 7:
-            container.bay = int(digits[0:3])
-            container.row = int(digits[3:5])
-            container.tier = int(digits[5:7])
+        if len(digits) >= 7 and (container.bay is None or container.row is None or container.tier is None):
+            container.bay = container.bay if container.bay is not None else int(digits[0:3])
+            container.row = container.row if container.row is not None else int(digits[3:5])
+            container.tier = container.tier if container.tier is not None else int(digits[5:7])
 
-        if qualifier in {"147", "11", "9"}:
-            container.block = location
+        if qualifier in {"147", "11", "9", "7"} and container.block is None:
+            container.block = location or None
 
     def _parse_dim(self, container: ParsedContainer, elements: list[str]) -> None:
         joined = ":".join(elements)
@@ -212,6 +232,18 @@ class EdiCoedorParser:
             return None
         head = value.split(":", 1)[0].strip()
         return head or None
+
+    def _extract_location_label(self, value: str | None) -> str | None:
+        if value is None:
+            return None
+
+        if "::" in value:
+            tail = value.split("::", 1)[1]
+            label = tail.split(":", 1)[0].strip()
+            if label:
+                return label
+
+        return self._extract_composite_value(value)
 
     def _extract_last_float(self, value: str) -> float | None:
         matches = re.findall(r"-?\d+(?:\.\d+)?", value)
